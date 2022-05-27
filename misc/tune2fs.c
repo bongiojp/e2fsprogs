@@ -82,11 +82,24 @@ extern int optind;
 #define FS_IOC_GETFSLABEL	_IOR(0x94, 49, char[FSLABEL_MAX])
 #endif
 
+struct fsuuid {
+	size_t len;
+	__u8 *b;
+};
+
+#ifndef EXT4_IOC_GETFSUUID
+#define EXT4_IOC_GETFSUUID	_IOR('f', 44, struct fsuuid)
+#endif
+
+#ifndef EXT4_IOC_SETFSUUID
+#define EXT4_IOC_SETFSUUID	_IOW('f', 45, struct fsuuid)
+#endif
+
 extern int ask_yn(const char *string, int def);
 
 const char *program_name = "tune2fs";
 char *device_name;
-char *new_label, *new_last_mounted, *new_UUID;
+char *new_label, *new_last_mounted, *requested_uuid;
 char *io_options;
 static int c_flag, C_flag, e_flag, f_flag, g_flag, i_flag, l_flag, L_flag;
 static int m_flag, M_flag, Q_flag, r_flag, s_flag = -1, u_flag, U_flag, T_flag;
@@ -2102,7 +2115,7 @@ static void parse_tune2fs_options(int argc, char **argv)
 				open_flag = EXT2_FLAG_RW;
 				break;
 		case 'U':
-			new_UUID = optarg;
+			requested_uuid = optarg;
 			U_flag = 1;
 			open_flag = EXT2_FLAG_RW |
 				EXT2_FLAG_JOURNAL_DEV_OK;
@@ -3078,6 +3091,67 @@ int handle_fslabel(int setlabel) {
 	return 0;
 }
 
+/*
+ * Use EXT4_IOC_GETFSUUID/EXT4_IOC_SETFSUUID to get/set file system UUID.
+ * Return:	0 on success
+ *		1 on error
+ *		-1 when the old method should be used
+ */
+int handle_fsuuid(__u8 *uuid, bool get) {
+	errcode_t ret;
+	int mnt_flags, fd;
+	char label[FSLABEL_MAX];
+	int maxlen = FSLABEL_MAX - 1;
+	char mntpt[PATH_MAX + 1];
+	struct fsuuid fsuuid;
+	fsuuid.b = uuid;
+	fsuuid.len = UUID_SIZE;
+
+	ret = ext2fs_check_mount_point(device_name, &mnt_flags,
+					  mntpt, sizeof(mntpt));
+	if (ret) {
+		com_err(device_name, ret, _("while checking mount status\n"));
+		return 1;
+	}
+	if (!(mnt_flags & EXT2_MF_MOUNTED) ||
+	    (!get && (mnt_flags & EXT2_MF_READONLY)))
+		return -1;
+
+	if (!mntpt[0]) {
+		fprintf(stderr,_("Unknown mount point for %s\n"), device_name);
+		return 1;
+	}
+
+	fd = open(mntpt, O_RDONLY);
+	if (fd < 0) {
+		com_err(mntpt, errno, _("while opening mount point\n"));
+		return 1;
+	}
+
+	if (get) {
+		if(ioctl(fd, EXT4_IOC_GETFSUUID, &fsuuid)) {
+			close(fd);
+			if (errno == ENOTTY)
+				return -1;
+			com_err(mntpt, errno, _("While trying to get "
+						"superblock UUID\n"));
+			return 1;
+		}
+	} else {
+		if (ioctl(fd, EXT4_IOC_SETFSUUID, &fsuuid)) {
+			close(fd);
+			if (errno == ENOTTY)
+				return -1;
+			com_err(mntpt, errno, _("While trying to set "
+						"superblock UUID\n"));
+			return 1;
+		}
+	}
+	close(fd);
+	return ret;
+}
+
+
 #ifndef BUILD_AS_LIB
 int main(int argc, char **argv)
 #else
@@ -3454,6 +3528,7 @@ _("Warning: The journal is dirty. You may wish to replay the journal like:\n\n"
 		dgrp_t i;
 		char buf[SUPERBLOCK_SIZE] __attribute__ ((aligned(8)));
 		__u8 old_uuid[UUID_SIZE];
+		uuid_t new_uuid;
 
 		if (ext2fs_has_feature_stable_inodes(fs->super)) {
 			fputs(_("Cannot change the UUID of this filesystem "
@@ -3507,25 +3582,41 @@ _("Warning: The journal is dirty. You may wish to replay the journal like:\n\n"
 				set_csum = 1;
 		}
 
-		memcpy(old_uuid, sb->s_uuid, UUID_SIZE);
-		if ((strcasecmp(new_UUID, "null") == 0) ||
-		    (strcasecmp(new_UUID, "clear") == 0)) {
-			uuid_clear(sb->s_uuid);
-		} else if (strcasecmp(new_UUID, "time") == 0) {
-			uuid_generate_time(sb->s_uuid);
-		} else if (strcasecmp(new_UUID, "random") == 0) {
-			uuid_generate(sb->s_uuid);
-		} else if (uuid_parse(new_UUID, sb->s_uuid)) {
+		rc = handle_fsuuid(old_uuid, true);
+		if (rc > 0)
+			goto closefs;
+		if (rc == -1) {
+			fputs(_("Reading directly from superblock.\n"), stdout);
+			memcpy(old_uuid, sb->s_uuid, UUID_SIZE);
+		}
+
+		if ((strcasecmp(requested_uuid, "null") == 0) ||
+		    (strcasecmp(requested_uuid, "clear") == 0)) {
+			uuid_clear(new_uuid);
+		} else if (strcasecmp(requested_uuid, "time") == 0) {
+			uuid_generate_time(new_uuid);
+		} else if (strcasecmp(requested_uuid, "random") == 0) {
+			uuid_generate(new_uuid);
+		} else if (uuid_parse(requested_uuid, new_uuid)) {
 			com_err(program_name, 0, "%s",
 				_("Invalid UUID format\n"));
 			rc = 1;
 			goto closefs;
 		}
-		ext2fs_init_csum_seed(fs);
-		if (set_csum) {
-			for (i = 0; i < fs->group_desc_count; i++)
-				ext2fs_group_desc_csum_set(fs, i);
-			fs->flags &= ~EXT2_FLAG_SUPER_ONLY;
+
+		rc = handle_fsuuid(new_uuid, false);
+		if (rc > 0)
+			goto closefs;
+		if (rc == -1) {
+			fputs(_("Writing directly to superblock.\n"), stdout);
+			memcpy(sb->s_uuid, new_uuid, UUID_SIZE);
+			ext2fs_init_csum_seed(fs);
+			if (set_csum) {
+				for (i = 0; i < fs->group_desc_count; i++)
+					ext2fs_group_desc_csum_set(fs, i);
+				fs->flags &= ~EXT2_FLAG_SUPER_ONLY;
+			}
+			ext2fs_mark_super_dirty(fs);
 		}
 
 		/* If this is a journal dev, we need to copy UUID into jsb */
@@ -3549,8 +3640,6 @@ _("Warning: The journal is dirty. You may wish to replay the journal like:\n\n"
 			if ((rc = fs_update_journal_user(sb, old_uuid)))
 				goto closefs;
 		}
-
-		ext2fs_mark_super_dirty(fs);
 	}
 
 	if (I_flag) {
