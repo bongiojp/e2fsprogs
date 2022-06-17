@@ -87,12 +87,33 @@ struct fsuuid {
 	__u8 *b;
 };
 
+
+
 #ifndef EXT4_IOC_GETFSUUID
 #define EXT4_IOC_GETFSUUID	_IOR('f', 44, struct fsuuid)
 #endif
 
 #ifndef EXT4_IOC_SETFSUUID
 #define EXT4_IOC_SETFSUUID	_IOW('f', 45, struct fsuuid)
+#endif
+
+struct ext4_feature_set {
+   __le32  compat;
+   __le32  incompat;
+   __le32  ro_compat;
+};
+
+struct ext4_feature_change_set {
+	struct ext4_feature_set before;
+	struct ext4_feature_set after;
+};
+
+#ifndef EXT4_IOC_GETFEATURES
+#define EXT4_IOC_GETFEATURES       _IOR('f', 46, struct ext4_feature_set)
+#endif
+
+#ifndef EXT4_IOC_SETFEATURES
+#define EXT4_IOC_SETFEATURES       _IOW('f', 47, struct ext4_feature_change_set)
 #endif
 
 extern int ask_yn(const char *string, int def);
@@ -1105,13 +1126,71 @@ try_confirm_csum_seed_support(void)
 }
 
 /*
+ * Use EXT4_IOC_GETFEATURES/EXT4_IOC_SETFEATURES to get/set feature set.
+ * Return:	0 on success
+ *		1 on error
+ *		-1 when the old method should be used
+ */
+int handle_features_ioctl(struct ext4_feature_change_set *feature_set,
+			bool get) {
+	errcode_t ret;
+	int mnt_flags, fd;
+	char label[FSLABEL_MAX];
+	int maxlen = FSLABEL_MAX - 1;
+	char mntpt[PATH_MAX + 1];
+
+	ret = ext2fs_check_mount_point(device_name, &mnt_flags,
+					  mntpt, sizeof(mntpt));
+	if (ret) {
+		com_err(device_name, ret, _("while checking mount status\n"));
+		return 1;
+	}
+	if (!(mnt_flags & EXT2_MF_MOUNTED) ||
+	    (!get && (mnt_flags & EXT2_MF_READONLY)))
+		return -1;
+
+	if (!mntpt[0]) {
+		fprintf(stderr,_("Unknown mount point for %s\n"), device_name);
+		return 1;
+	}
+
+	fd = open(mntpt, O_RDONLY);
+	if (fd < 0) {
+		com_err(mntpt, errno, _("while opening mount point\n"));
+		return 1;
+	}
+
+	if (get) {
+		if(ioctl(fd, EXT4_IOC_GETFEATURES, &feature_set->before)) {
+			close(fd);
+			if (errno == ENOTTY)
+				return -1;
+			com_err(mntpt, errno, _("while trying to get "
+						"feature set\n"));
+			return 1;
+		}
+	} else {
+		if (ioctl(fd, EXT4_IOC_SETFEATURES, feature_set)) {
+			close(fd);
+			if (errno == ENOTTY)
+				return -1;
+			com_err(mntpt, errno, _("while trying to set "
+						"feature set\n"));
+			return 1;
+		}
+	}
+	close(fd);
+	return 0;
+}
+
+/*
  * Update the feature set as provided by the user.
  */
 static int update_feature_set(ext2_filsys fs, char *features)
 {
 	struct ext2_super_block *sb = fs->super;
 	__u32		old_features[3];
-	int		type_err;
+	int		type_err, rc;
 	unsigned int	mask_err;
 	errcode_t	err;
 	enum quota_type qtype;
@@ -1122,6 +1201,27 @@ static int update_feature_set(ext2_filsys fs, char *features)
 				 !((&sb->s_feature_compat)[(type)] & (mask)))
 #define FEATURE_CHANGED(type, mask) ((mask) & \
 		     (old_features[(type)] ^ (&sb->s_feature_compat)[(type)]))
+
+	/* Before reading/writing feature set directly from superblock,
+	 * try to change feature set through ioctls. This ensures that
+	 * the filesystem is not being resized.
+	 */
+	if (mount_flags & EXT2_MF_MOUNTED) {
+		struct ext4_feature_change_set feature_set;
+		rc = handle_features_ioctl(&feature_set, true);
+		if (rc > 0)
+			return rc;
+		if (!rc) {
+			feature_set.after = feature_set.before;
+			if (!e2p_edit_feature2(features,
+						&feature_set.after.compat,
+						ok_features, clear_ok_features,
+						&type_err, &mask_err)) {
+				return handle_features_ioctl(&feature_set,
+							false);
+			}
+		}
+	}
 
 	old_features[E2P_FEATURE_COMPAT] = sb->s_feature_compat;
 	old_features[E2P_FEATURE_INCOMPAT] = sb->s_feature_incompat;
@@ -3150,7 +3250,6 @@ int handle_fsuuid(__u8 *uuid, bool get) {
 	close(fd);
 	return ret;
 }
-
 
 #ifndef BUILD_AS_LIB
 int main(int argc, char **argv)
