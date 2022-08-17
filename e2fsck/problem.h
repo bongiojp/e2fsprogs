@@ -823,6 +823,9 @@ struct problem_context {
 /* Inode extent tree could be narrower */
 #define PR_1E_CAN_NARROW_EXTENT_TREE	0x014007
 
+/* Inode extent index entry has no entries. An index entry cannot be a leaf. */
+#define PR_1E_INVALID_EXTENT_IDX_ENTRY	0x014008
+
 /*
  * Pass 2 errors
  */

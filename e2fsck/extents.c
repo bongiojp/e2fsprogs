@@ -580,6 +580,18 @@ errcode_t e2fsck_should_rebuild_extents(e2fsck_t ctx,
 	extents_per_block = (ctx->fs->blocksize -
 			     sizeof(struct ext3_extent_header)) /
 			    sizeof(struct ext3_extent);
+
+	/*
+	 * Yes fix it.
+	 */
+	printf("current level of extent (should be > 0): %d\n", info->curr_level);
+	printf("num of entries of idx entry: %d\n", info->num_entries);
+	if (info->num_entries == 0 && info->curr_level > 0) {
+		pctx->blk = 0;
+		op = PR_1E_INVALID_EXTENT_IDX_ENTRY;
+		goto rebuild;
+	}
+
 	/*
 	 * If we can consolidate a level or shorten the tree, schedule the
 	 * extent tree to be rebuilt.

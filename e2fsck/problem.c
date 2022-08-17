@@ -1454,6 +1454,11 @@ static struct e2fsck_problem problem_table[] = {
 	  N_("@i %i @x tree (at level %b) could be narrower.  "),
 	  PROMPT_OPTIMIZE, PR_NO_OK | PR_PREEN_NO | PR_PREEN_OK | PR_NOT_A_FIX, 0, 0, 0 },
 
+	/* Inode extent index entry has no entries. An index entry cannot be a leaf. */
+	{ PR_1E_INVALID_EXTENT_IDX_ENTRY,
+	  N_("@i %i @x tree (at level %b) could be narrower.  "),
+	  PROMPT_FIX, 0, 0, 0, 0 },
+
 	/* Pass 2 errors */
 
 	/* Pass 2: Checking directory structure */
